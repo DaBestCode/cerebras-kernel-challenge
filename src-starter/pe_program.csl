@@ -40,6 +40,10 @@ var hgather_idxs  = @zeros([Pw * K]i32);
 var vgather_dists = @zeros([Ph * K]f32);
 var vgather_idxs  = @zeros([Ph * K]i32);
 
+// Merge temp buffers — module-level to avoid stack overflow for large K
+var merge_tmp_d = @zeros([K]f32);
+var merge_tmp_i = @zeros([K]i32);
+
 // Final output exported to host
 var out_indices   = @zeros([K]i32);
 var out_distances = @zeros([K]f32);
@@ -70,8 +74,6 @@ fn sort_topk() void {
 // src_dists[p*K .. p*K+K] and src_idxs[p*K .. p*K+K] are sorted ascending
 fn merge_gathered(src_dists: [*]f32, src_idxs: [*]i32, num_lists: u16) void {
     var heads = @zeros([4]u16);
-    var tmp_d = @zeros([K]f32);
-    var tmp_i = @zeros([K]i32);
 
     var out: u16 = 0;
     while (out < K) : (out += 1) {
@@ -88,14 +90,14 @@ fn merge_gathered(src_dists: [*]f32, src_idxs: [*]i32, num_lists: u16) void {
                 }
             }
         }
-        tmp_d[out] = best_d;
-        tmp_i[out] = best_i;
+        merge_tmp_d[out] = best_d;
+        merge_tmp_i[out] = best_i;
         heads[best_p] += 1;
     }
     var k: u16 = 0;
     while (k < K) : (k += 1) {
-        local_dists[k] = tmp_d[k];
-        local_idxs[k]  = tmp_i[k];
+        local_dists[k] = merge_tmp_d[k];
+        local_idxs[k]  = merge_tmp_i[k];
     }
 }
 
