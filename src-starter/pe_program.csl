@@ -1,0 +1,236 @@
+param memcpy_params;
+param c2d_params;
+param K           : u16;
+param d_dim       : u16;
+param rows_per_pe : u16;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const mpi_x   = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.x });
+const mpi_y   = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.y });
+
+const Pw = @get_rectangle().width;
+const Ph = @get_rectangle().height;
+
+// Task IDs — must not overlap colors 0,1,4,5 or entrypoints 14,15,16,17
+const EXIT              : local_task_id = @get_local_task_id(9);
+const compute_task      : local_task_id = @get_local_task_id(11);
+const hgather_dist_task : local_task_id = @get_local_task_id(12);
+const hgather_idx_task  : local_task_id = @get_local_task_id(13);
+const vgather_dist_task : local_task_id = @get_local_task_id(18);
+const vgather_idx_task  : local_task_id = @get_local_task_id(19);
+
+var pe_x: u16 = 0;
+var pe_y: u16 = 0;
+
+// Database shard and query
+var D_shard = @zeros([rows_per_pe * d_dim]f32);
+var ptr_D   : [*]f32 = &D_shard;
+var q       = @zeros([d_dim]f32);
+var ptr_q   : [*]f32 = &q;
+
+// Local top-K (unsorted during compute, sorted before gather)
+var local_dists = @zeros([K]f32);
+var local_idxs  = @zeros([K]i32);
+
+// Horizontal gather buffers: PE(r,0) collects from P PEs in its row
+var hgather_dists = @zeros([Pw * K]f32);
+var hgather_idxs  = @zeros([Pw * K]i32);
+
+// Vertical gather buffers: PE(Ph-1,0) collects from P PEs in column 0
+var vgather_dists = @zeros([Ph * K]f32);
+var vgather_idxs  = @zeros([Ph * K]i32);
+
+// Final output exported to host
+var out_indices   = @zeros([K]i32);
+var out_distances = @zeros([K]f32);
+var ptr_indices   : [*]i32 = &out_indices;
+var ptr_distances : [*]f32 = &out_distances;
+
+// ── Sort local_dists/local_idxs ascending by (dist, idx) ─────────────────────
+fn sort_topk() void {
+    var i: u16 = 1;
+    while (i < K) : (i += 1) {
+        const kd = local_dists[i];
+        const ki = local_idxs[i];
+        var j: i16 = @as(i16, i) - 1;
+        while (j >= 0) : (j -= 1) {
+            const ju = @as(u16, j);
+            if (local_dists[ju] > kd or
+                (local_dists[ju] == kd and local_idxs[ju] > ki)) {
+                local_dists[ju + 1] = local_dists[ju];
+                local_idxs[ju  + 1] = local_idxs[ju];
+            } else { break; }
+        }
+        local_dists[@as(u16, j + 1)] = kd;
+        local_idxs[@as(u16, j  + 1)] = ki;
+    }
+}
+
+// ── Merge num_lists sorted top-K arrays into local_dists/local_idxs ──────────
+// src_dists[p*K .. p*K+K] and src_idxs[p*K .. p*K+K] are sorted ascending
+fn merge_gathered(src_dists: [*]f32, src_idxs: [*]i32, num_lists: u16) void {
+    var heads = @zeros([4]u16);
+    var tmp_d = @zeros([K]f32);
+    var tmp_i = @zeros([K]i32);
+
+    var out: u16 = 0;
+    while (out < K) : (out += 1) {
+        var best_d: f32 = 1e38;
+        var best_i: i32 = 0x7fffffff;
+        var best_p: u16 = 0;
+        var p: u16 = 0;
+        while (p < num_lists) : (p += 1) {
+            if (heads[p] < K) {
+                const d = src_dists[p * K + heads[p]];
+                const i = src_idxs [p * K + heads[p]];
+                if (d < best_d or (d == best_d and i < best_i)) {
+                    best_d = d; best_i = i; best_p = p;
+                }
+            }
+        }
+        tmp_d[out] = best_d;
+        tmp_i[out] = best_i;
+        heads[best_p] += 1;
+    }
+    var k: u16 = 0;
+    while (k < K) : (k += 1) {
+        local_dists[k] = tmp_d[k];
+        local_idxs[k]  = tmp_i[k];
+    }
+}
+
+// ── PHASE 1: main — entry point ───────────────────────────────────────────────
+fn main() void {
+    mpi_x.init();
+    mpi_y.init();
+    pe_x = mpi_x.pe_id;
+    pe_y = mpi_y.pe_id;
+    @activate(compute_task);
+}
+
+// ── PHASE 2: compute local top-K ─────────────────────────────────────────────
+task compute() void {
+    // Init heap to infinity
+    var k: u16 = 0;
+    while (k < K) : (k += 1) {
+        local_dists[k] = 1e38;
+        local_idxs[k]  = 0x7fffffff;
+    }
+
+    const pe_id      : u16 = pe_y * Pw + pe_x;
+    const row_offset : i32 = @as(i32, pe_id) * @as(i32, rows_per_pe);
+    var worst_pos    : u16 = 0;
+    var worst_d      : f32 = 1e38;
+    var filled       : u16 = 0;
+
+    var i: u16 = 0;
+    while (i < rows_per_pe) : (i += 1) {
+        var dist: f32 = 0.0;
+        var d: u16 = 0;
+        while (d < d_dim) : (d += 1) {
+            const diff = D_shard[i * d_dim + d] - q[d];
+            dist += diff * diff;
+        }
+        const gidx: i32 = row_offset + @as(i32, i);
+
+        if (filled < K) {
+            local_dists[filled] = dist;
+            local_idxs[filled]  = gidx;
+            filled += 1;
+            if (filled == K) {
+                worst_pos = 0; worst_d = local_dists[0];
+                var kk: u16 = 1;
+                while (kk < K) : (kk += 1) {
+                    if (local_dists[kk] > worst_d or
+                        (local_dists[kk] == worst_d and local_idxs[kk] > local_idxs[worst_pos])) {
+                        worst_d = local_dists[kk]; worst_pos = kk;
+                    }
+                }
+            }
+        } else if (dist < worst_d or (dist == worst_d and gidx < local_idxs[worst_pos])) {
+            local_dists[worst_pos] = dist;
+            local_idxs[worst_pos]  = gidx;
+            worst_pos = 0; worst_d = local_dists[0];
+            var kk: u16 = 1;
+            while (kk < K) : (kk += 1) {
+                if (local_dists[kk] > worst_d or
+                    (local_dists[kk] == worst_d and local_idxs[kk] > local_idxs[worst_pos])) {
+                    worst_d = local_dists[kk]; worst_pos = kk;
+                }
+            }
+        }
+    }
+    sort_topk();
+
+    // Step 1 of 4: gather distances across row to PE(pe_y, 0)
+    mpi_x.gather(0,
+        @ptrcast([*]u32, &local_dists),
+        @ptrcast([*]u32, &hgather_dists),
+        K, hgather_dist_task);
+}
+
+// ── PHASE 3a: horizontal dist gather done → now gather indices ───────────────
+task hgather_dist() void {
+    // Distances are now in hgather_dists at PE(r,0)
+    // Immediately gather indices across same row
+    mpi_x.gather(0,
+        @ptrcast([*]u32, &local_idxs),
+        @ptrcast([*]u32, &hgather_idxs),
+        K, hgather_idx_task);
+}
+
+// ── PHASE 3b: horizontal idx gather done → merge, then vertical ──────────────
+task hgather_idx() void {
+    if (pe_x == 0) {
+        // We now have both hgather_dists and hgather_idxs fully populated
+        // Merge Pw sorted top-K lists into local_dists/local_idxs
+        merge_gathered(&hgather_dists, &hgather_idxs, Pw);
+        // local_dists/local_idxs now holds best K from this row
+    }
+
+    // Step 3 of 4: gather distances down column 0 to PE(Ph-1, 0)
+    mpi_y.gather(Ph - 1,
+        @ptrcast([*]u32, &local_dists),
+        @ptrcast([*]u32, &vgather_dists),
+        K, vgather_dist_task);
+}
+
+// ── PHASE 4a: vertical dist gather done → gather indices ─────────────────────
+task vgather_dist() void {
+    mpi_y.gather(Ph - 1,
+        @ptrcast([*]u32, &local_idxs),
+        @ptrcast([*]u32, &vgather_idxs),
+        K, vgather_idx_task);
+}
+
+// ── PHASE 4b: vertical idx gather done → final merge ─────────────────────────
+task vgather_idx() void {
+    if (pe_x == 0 and pe_y == Ph - 1) {
+        merge_gathered(&vgather_dists, &vgather_idxs, Ph);
+        var k: u16 = 0;
+        while (k < K) : (k += 1) {
+            out_indices[k]   = local_idxs[k];
+            out_distances[k] = local_dists[k];
+        }
+    }
+    @activate(EXIT);
+}
+
+task f_exit() void {
+    sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+    @bind_local_task(compute,       compute_task);
+    @bind_local_task(hgather_dist,  hgather_dist_task);
+    @bind_local_task(hgather_idx,   hgather_idx_task);
+    @bind_local_task(vgather_dist,  vgather_dist_task);
+    @bind_local_task(vgather_idx,   vgather_idx_task);
+    @bind_local_task(f_exit,        EXIT);
+
+    @export_symbol(ptr_D,         "D");
+    @export_symbol(ptr_q,         "q");
+    @export_symbol(ptr_indices,   "indices");
+    @export_symbol(ptr_distances, "distances");
+    @export_symbol(main);
+}

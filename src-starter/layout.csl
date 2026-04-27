@@ -1,0 +1,50 @@
+// layout.csl — compile-time blueprint for the P×P PE grid
+// Receives --params from cslc command line
+
+// ── Compile-time parameters (from --params flag) ──────────────────────────────
+param P           : u16;  // grid dimension (P×P PEs)
+param d_dim       : u16;  // vector dimension
+param rows_per_pe : u16;  // rows of D each PE owns
+param K           : u16;  // number of nearest neighbors
+
+// ── SDK module imports (layout-level only) ────────────────────────────────────
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width  = P,
+    .height = P
+});
+const c2d = @import_module("<collectives_2d/params>");
+
+// ── Layout block ──────────────────────────────────────────────────────────────
+layout {
+    @set_rectangle(P, P);
+
+    var pe_x: u16 = 0;
+    while (pe_x < P) : (pe_x += 1) {
+        const memcpy_params = memcpy.get_params(pe_x);
+
+        var pe_y: u16 = 0;
+        while (pe_y < P) : (pe_y += 1) {
+            const c2d_params = c2d.get_params(pe_x, pe_y, .{
+                .x_colors      = .{ @get_color(0),           @get_color(1)          },
+                .x_entrypoints = .{ @get_local_task_id(14),  @get_local_task_id(15) },
+                .y_colors      = .{ @get_color(4),           @get_color(5)          },
+                .y_entrypoints = .{ @get_local_task_id(16),  @get_local_task_id(17) },
+            });
+
+            @set_tile_code(pe_x, pe_y, "pe_program.csl", .{
+                .memcpy_params = memcpy_params,
+                .c2d_params    = c2d_params,
+                .K             = K,
+                .d_dim         = d_dim,
+                .rows_per_pe   = rows_per_pe,
+            });
+        }
+    }
+
+    // Symbols the host (run.py) can read/write
+    @export_name("D",         [*]f32, true);
+    @export_name("q",         [*]f32, true);
+    @export_name("indices",   [*]i32, true);
+    @export_name("distances", [*]f32, true);
+    @export_name("main",      fn()void);
+}
